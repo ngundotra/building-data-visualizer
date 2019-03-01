@@ -1,20 +1,24 @@
-import sys
+import sys, json
 import osmium as osm
-import json
+import pyproj
 import shapely.wkb as wkblib
+import shapely.ops as ops
 from shapely.geometry import mapping
-
-
-# def sig_handler(signum, frame):
-#     print("segfault")
-# signal.signal(signal.SIGSEGV, sig_handler)
+from functools import partial
+import pdb
 
 class BuildingProcessor(osm.SimpleHandler):
-    def __init__(self, wkfab, verbosity=0):
+    def __init__(self, wkfab, eui_loc, verbosity=0):
         osm.SimpleHandler.__init__(self)
+
         self.verbose = verbosity
+        self.eui_loc = eui_loc
+        # Sanity check to make sure the region passed is valid
+        self.find_eui()
+
         self.a = 0
         self.nodes = {}
+
         self.wkfab = wkfab
         self.height_found = 0 
         self.buildings = []
@@ -46,6 +50,33 @@ class BuildingProcessor(osm.SimpleHandler):
 #                 height = tags['height']
 #                 name = tags['name']
 #                 self.buildings.append((name, height, geojson))
+
+    def find_eui(self):
+        """find energy usage intensity to estimate energy usage in kWh/m^2"""
+        name = self.eui_loc.lower()
+        if name == 'mumbai':
+            return 54
+        elif name == 'new delhi':
+            return 57
+        else:
+            raise ValueError("Could not find given region in our EUI lookup: {}".format(self.eui_loc))
+
+    def calculate_energy(self, geojson):
+        """Calculate energy based upon information in the geojson"""
+        props = geojson['properties']
+        levels = int(props.get('building:levels', -1))
+        area = props.get('area')
+        height = props.get('height', -1)
+        
+        if height != -1:
+            height = self.parse_height(height)
+
+        if levels < 0 and height > 0:
+            levels  = height // 3 # assume each level is 3m
+        elif levels < 0 and height < 0:
+            levels = 1
+        eui = self.find_eui()
+        return eui * levels * area 
 
     def parse_height(self, given):
         n = 0
@@ -102,14 +133,26 @@ class BuildingProcessor(osm.SimpleHandler):
         self.a += 1
         if 'building' not in a.tags:
             return
-        wkb = self.wkfab.create_multipolygon(a)
-        poly = wkblib.loads(wkb, hex=True)
-        geojson = mapping(poly)
-
         # It's a building
         self.b += 1
-        if 'properties' not in geojson:
-            geojson['properties'] = {}
+        
+        # Polygon recreation
+        wkb = self.wkfab.create_multipolygon(a)
+        poly = wkblib.loads(wkb, hex=True)
+        geom_area = ops.transform(
+                partial(
+                    pyproj.transform,
+                    pyproj.Proj(init='EPSG:4326'),
+                    pyproj.Proj(
+                        proj='aea',
+                        lat1=poly.bounds[1],
+                        lat2=poly.bounds[3])),
+                    poly)
+        geojson = {'type': 'Feature', 'properties':{},
+                'geometry': mapping(poly)}
+
+        geojson['properties']['area'] = geom_area.area
+
         if 'building:levels' in a.tags:
             self.bh += 1
             geojson['properties']['building:levels'] = a.tags['building:levels']
@@ -124,6 +167,7 @@ class BuildingProcessor(osm.SimpleHandler):
 
         if 'name' in a.tags:
             geojson['properties']['name'] = a.tags['name']
+        geojson['properties']['eui'] = self.calculate_energy(geojson)
         self.buildings.append(geojson)
         
 #         # Check for building heights in any of the node tags
@@ -161,16 +205,18 @@ class BuildingProcessor(osm.SimpleHandler):
 if __name__ == '__main__':
     """
     We scrape an OSM file, looking for named buildings with heights, and store them into an optional output file.
-    i.e. `python scrape.py OSM_FILE OUTPUT_FILE`
+    i.e. `python scrape.py OSM_FILE REGION OUTPUT_FILE`
+    `python scrape.py mumbai.osm Mumbai mumbai.geojson`
     where OUTPUT_FILE is optional
     """
-    if len(sys.argv) < 2:
+    if len(sys.argv) < 3:
         raise ValueError("Missing a filename to parse")
-    elif len(sys.argv) == 2:
-        _this_, to_parse = sys.argv
+    elif len(sys.argv) == 3:
+        _this_, to_parse, region = sys.argv
         fname_to_save = to_parse.replace(".osm.pbf", ".geojson")
         fname_to_save = to_parse.replace(".osm", ".geojson")
-    elif len(sys.argv) == 3:
+    elif len(sys.argv) == 4:
+        region = sys.argv[-2]
         fname_to_save = sys.argv[-1]
     else:
         raise ValueError("Too many arguments passed (>4)")
@@ -179,7 +225,7 @@ if __name__ == '__main__':
     print("Reading file: {}".format(to_parse))
    
     wkbfab = osm.geom.WKBFactory()
-    tlhandler = BuildingProcessor(wkbfab)
+    tlhandler = BuildingProcessor(wkbfab, region)
     tlhandler.apply_file(to_parse)
 
     # Print statistics
@@ -190,5 +236,6 @@ if __name__ == '__main__':
     # Save the buildings with heights & names to a file
     print("Saving named & heighted buildings to {}".format(fname_to_save))
     with open(fname_to_save, 'w') as out_file:
-        json.dump(tlhandler.buildings, out_file)
+        geodict = {'type': 'FeatureCollection', 'features': tlhandler.buildings}
+        json.dump(geodict, out_file)
 
