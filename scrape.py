@@ -167,7 +167,17 @@ class BuildingProcessor(osm.SimpleHandler):
 
         if 'name' in a.tags:
             geojson['properties']['name'] = a.tags['name']
+        
         geojson['properties']['eui'] = self.calculate_energy(geojson)
+        # ONLY FOR DEBUGGING THE 3D OSM VISUALIZER
+        # geojson['geometry']['type'] = 'Polygon'
+        if geojson['geometry']['type'] == 'MultiPolygon':
+            coords = geojson['geometry']['coordinates']
+            if len(coords) == 1:
+                geojson['geometry']['coordinates'] = coords[0]
+                geojson['geometry']['type'] = 'Polygon'
+            else:
+                print("Could not be resolved!: {}".format(len(coords)))
         self.buildings.append(geojson)
         
 #         # Check for building heights in any of the node tags
